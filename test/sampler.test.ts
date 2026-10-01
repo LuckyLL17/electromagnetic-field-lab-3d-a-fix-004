@@ -11,7 +11,9 @@ import {
   sampleKey,
   samplePlane,
   samplePlaneSync,
+  sectionUV,
   validateSpec,
+  worldToPlane,
   type SampleRequest,
 } from '../src/sampler';
 
@@ -48,11 +50,25 @@ async function main(): Promise<void> {
     assert.ok(!k1.includes('camera'));
   });
 
-  // 3. 平面映射：同 (axis,offset,u,v) 永远是同一物理点
-  await test('planePoint 映射到确定的世界坐标', () => {
+  // 3. 平面映射：同 (axis,offset,u,v) 永远是同一物理点；world ↔ field 往返一致
+  await test('planePoint / worldToPlane 显式往返世界坐标', () => {
     assert.deepStrictEqual(planePoint({ axis: 'z', offset: 1.2 }, 0.3, -0.4), { x: 0.3, y: -0.4, z: 1.2 });
     assert.deepStrictEqual(planePoint({ axis: 'x', offset: -2 }, 0.3, -0.4), { x: -2, y: 0.3, z: -0.4 });
     assert.deepStrictEqual(planePoint({ axis: 'y', offset: 0 }, 0.3, -0.4), { x: 0.3, y: 0, z: -0.4 });
+    for (const axis of ['x', 'y', 'z'] as const) {
+      const spec = { axis, offset: 0.8 };
+      const p = planePoint(spec, 0.5, -0.7);
+      const back = worldToPlane(spec, p);
+      assert.strictEqual(back.along, 0.8);
+      assert.strictEqual(back.u, 0.5);
+      assert.strictEqual(back.v, -0.7);
+      // 选点仍在当前剖面上 → 归一化 u/v
+      assert.deepStrictEqual(sectionUV(spec, 4, p), { u: 0.25, v: -0.35 });
+    }
+    // 越界清除：法向偏离剖面 或 面内超出边长 → null
+    assert.strictEqual(sectionUV({ axis: 'z', offset: 0.6 }, 4, { x: 0, y: 0, z: 1.4 }), null);
+    assert.strictEqual(sectionUV({ axis: 'z', offset: 0.6 }, 4, { x: 2.1, y: 0, z: 0.6 }), null);
+    assert.strictEqual(sectionUV({ axis: 'z', offset: 0.6 }, 4, { x: NaN, y: 0, z: 0.6 }), null);
   });
 
   // 4. 无效位置
@@ -72,30 +88,74 @@ async function main(): Promise<void> {
     assert.ok(r.stats.mean > 0);
   });
 
-  // 6. 高密度取消：abort 后 promise 以 AbortError 拒绝，无部分结果落地
+  // 6. 高密度取消：确定在任务未完成时 abort，promise 以 AbortError 拒绝，无部分结果落地。
+  //    不依赖任何固定延时：用一次性忙等保证第一个分块就超过让出阈值（任务必然
+  //    未完成且必然在分块间 await），在 onProgress 报告未完成进度时触发 abort。
   await test('中止中的精细采样抛出 AbortError', async () => {
     const ac = new AbortController();
-    const p = samplePlane({ ...baseReq, n: 400 }, field, ac.signal);
-    await new Promise((r) => setTimeout(r, 30));
-    ac.abort();
+    let unfinishedProgress = false;
+    let spun = false;
+    const slowField = (x: number, y: number, z: number): number => {
+      if (!spun) {
+        spun = true;
+        const t = performance.now();
+        while (performance.now() - t < 25) {
+          /* 强制首个分块超过 YIELD_MS，与机器速度无关 */
+        }
+      }
+      return field(x, y, z);
+    };
+    const p = samplePlane({ ...baseReq, n: 400 }, slowField, ac.signal, (done, total) => {
+      if (done < total) {
+        unfinishedProgress = true;
+        setTimeout(abortNow, 0); // 与 worker 的让出同为宏任务；progress 先注册故先执行
+      }
+    });
+    p.catch(() => undefined); // 被取消是预期路径，消费 rejection
+    function abortNow(): void {
+      assert.ok(unfinishedProgress, 'abort 必须在任务完成前触发');
+      ac.abort();
+    }
+    // 任务正 await 在第一、二分块之间，下一分块前必见 abort：
     await assert.rejects(
       p,
       (e: unknown) => e instanceof DOMException && (e as DOMException).name === 'AbortError',
     );
   });
 
-  // 7. 调度器：过期结果不落地（连续 run，旧任务被取消）
+  // 7. 调度器：过期结果不落地（在 p1 未完成时确定地用 p2 取代它）
   await test('调度器丢弃过期任务结果', async () => {
     const sch = new SamplerScheduler();
-    // 被取消是预期路径：同步挂处理器（与 hook 中 .catch 消费的用法一致）
-    const p1: Promise<unknown> = sch
-      .run({ ...baseReq, n: 300, offset: 0 }, field)
-      .catch((e: unknown) => e);
-    await new Promise((r) => setTimeout(r, 20));
-    const p2 = sch.run({ ...baseReq, n: 300, offset: 1.5 }, field); // 立即取代 p1
+    let spun = false;
+    const slowField = (x: number, y: number, z: number): number => {
+      if (!spun) {
+        spun = true;
+        const t = performance.now();
+        while (performance.now() - t < 25) {
+          /* 强制首个分块让出，确保 p1 被取代时仍在飞行中 */
+        }
+      }
+      return field(x, y, z);
+    };
+    // p1 报告未完成进度时（此刻它必然在分块间 await）再启动 p2，取代关系与机器速度无关。
+    let fired = false;
+    let p1: Promise<unknown>;
+    const gate = new Promise<void>((resolve) => {
+      p1 = sch
+        .run({ ...baseReq, n: 300, offset: 0 }, slowField, (done, total) => {
+          if (!fired && done < total) {
+            fired = true;
+            setTimeout(resolve, 0);
+          }
+        })
+        // 被取消是预期路径：同步挂处理器（与 hook 中 .catch 消费的用法一致）
+        .catch((e: unknown) => e);
+    });
+    await gate;
+    const p2 = sch.run({ ...baseReq, n: 300, offset: 1.5 }, slowField); // 立即取代在飞的 p1
     const r2 = await p2;
     assert.strictEqual(r2.spec.offset, 1.5);
-    const e1 = (await p1) as DOMException;
+    const e1 = (await p1!) as DOMException;
     assert.ok(e1 instanceof DOMException, '过期任务应以 AbortError 结束');
     assert.strictEqual(e1.name, 'AbortError');
     assert.ok(!sch.has(sampleKey({ ...baseReq, n: 300, offset: 0 })), '过期结果不得进入缓存');

@@ -18,6 +18,13 @@ export interface PlaneSpec {
   offset: number;
 }
 
+/** 物理世界坐标点。剖面中心、选点一律以此类型持久化，与相机 / 父级变换无关。 */
+export interface WorldPoint {
+  x: number;
+  y: number;
+  z: number;
+}
+
 export interface SampleRequest extends PlaneSpec {
   /** 每边采样点数（n × n）。 */
   n: number;
@@ -95,7 +102,7 @@ async function samplePlaneWork(
   signal?: AbortSignal,
   onProgress?: (done: number, total: number) => void,
 ): Promise<SampleResult> {
-  const { axis, offset, n, size } = spec;
+  const { n, size } = spec;
   if (!Number.isInteger(n) || n < 2 || n > 1024) {
     throw new InvalidSpecError(`采样密度无效: ${String(n)}`);
   }
@@ -120,22 +127,8 @@ async function samplePlaneWork(
       const col = k % n; // u: -half → +half
       const u = -half + (col / (n - 1)) * size;
       const v = -half + (row / (n - 1)) * size;
-      let x = 0;
-      let y = 0;
-      let z = 0;
-      if (axis === 'x') {
-        x = offset;
-        y = u;
-        z = v;
-      } else if (axis === 'y') {
-        x = u;
-        y = offset;
-        z = v;
-      } else {
-        x = u;
-        y = v;
-        z = offset;
-      }
+      // 显式 field 转换：面内 (u,v) 网格坐标 → 物理世界 (x,y,z) 后再交给场模型。
+      const { x, y, z } = planePoint(spec, u, v);
       let m: number;
       try {
         m = sample(x, y, z);
@@ -172,7 +165,7 @@ export function samplePlaneSync(
   spec: SampleRequest,
   sample: (x: number, y: number, z: number) => number,
 ): SampleResult {
-  const { axis, offset, n, size } = spec;
+  const { n, size } = spec;
   const values = new Float64Array(n * n);
   let max = 0;
   let sum = 0;
@@ -182,22 +175,8 @@ export function samplePlaneSync(
     for (let col = 0; col < n; col++) {
       const u = -half + (col / (n - 1)) * size;
       const v = -half + (row / (n - 1)) * size;
-      let x = 0;
-      let y = 0;
-      let z = 0;
-      if (axis === 'x') {
-        x = offset;
-        y = u;
-        z = v;
-      } else if (axis === 'y') {
-        x = u;
-        y = offset;
-        z = v;
-      } else {
-        x = u;
-        y = v;
-        z = offset;
-      }
+      // 显式 field 转换：与异步路径共用同一套世界坐标映射，保证统计口径一致。
+      const { x, y, z } = planePoint(spec, u, v);
       let m: number;
       try {
         m = sample(x, y, z);
@@ -225,11 +204,46 @@ export function samplePlaneSync(
 }
 
 /** 把 (u, v) 平面局部坐标（[-size/2, size/2]）换算为物理世界坐标。 */
-export function planePoint(spec: PlaneSpec, u: number, v: number): { x: number; y: number; z: number } {
+export function planePoint(spec: PlaneSpec, u: number, v: number): WorldPoint {
   const { axis, offset } = spec;
   if (axis === 'x') return { x: offset, y: u, z: v };
   if (axis === 'y') return { x: u, y: offset, z: v };
   return { x: u, y: v, z: offset };
+}
+
+/**
+ * 世界坐标 → 剖面坐标的显式转换：给定物理点，求它在当前剖面上的
+ * (法向分量, 面内 u, 面内 v)。面内基为与采样循环一致的循环右手系：
+ *  x 面 (u=y, v=z) · y 面 (u=x, v=z) · z 面 (u=x, v=y)。
+ */
+export function worldToPlane(spec: PlaneSpec, p: WorldPoint): { along: number; u: number; v: number } {
+  switch (spec.axis) {
+    case 'x':
+      return { along: p.x, u: p.y, v: p.z };
+    case 'y':
+      return { along: p.y, u: p.x, v: p.z };
+    default:
+      return { along: p.z, u: p.x, v: p.y };
+  }
+}
+
+/**
+ * 判断世界坐标选点是否仍在当前剖面的采样范围内：
+ * 法向距离必须贴合 offset，面内 (u,v) 必须落在边长 size 的方形区域内。
+ * 返回其归一化 (-1..1) 面内坐标；越界返回 null（调用方据此清除选点）。
+ */
+export function sectionUV(
+  spec: PlaneSpec,
+  size: number,
+  p: WorldPoint,
+  eps = 1e-3,
+): { u: number; v: number } | null {
+  const { along, u, v } = worldToPlane(spec, p);
+  if (![along, u, v].every(Number.isFinite)) return null;
+  if (Math.abs(along - spec.offset) > eps) return null;
+  const half = size / 2 + eps;
+  if (Math.abs(u) > half || Math.abs(v) > half) return null;
+  return { u: u / (size / 2), v: v / (size / 2) };
 }
 
 /**

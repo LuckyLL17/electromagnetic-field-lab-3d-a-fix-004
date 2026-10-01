@@ -1,15 +1,16 @@
 import { useEffect, useMemo, useRef } from 'react';
 import { useThree, type ThreeEvent } from '@react-three/fiber';
 import * as THREE from 'three';
-import type { Axis, PlaneSpec } from './sampler';
-
+import { planePoint, sectionUV, type Axis, type PlaneSpec, type WorldPoint } from './sampler';
 /**
  * 可拖动的三维测量剖面。
- * - 平面 / 手柄 / 选点标记全部挂在场源同一个父 group 内，
- *   通过 parent.worldToLocal 换算，因此父级的演示旋转对物理坐标透明；
- * - 拖动沿「世界坐标法向」进行：拖动平面包含整条法向轴，射线交点投影到
- *   物理法向即得 offset。相机轨道、缩放只改变射线方向，同一 offset
- *   永远表示同一个物理位置。
+ * - 组件直接挂载在场景根（不进入任何演示旋转 group），因此内部局部坐标即
+ *   物理世界坐标：剖面 { axis, offset }、选点世界坐标与 sampler 的采样网格
+ *   严格重合，相机轨道 / 缩放 / 父级变换都不影响其物理含义；
+ * - 拖动沿「世界坐标法向」进行：拖动平面包含整条法向轴，射线交点直接读出
+ *   世界坐标并投影到物理法向，即得新的 offset；
+ * - 选点以世界坐标持久化。标记始终渲染在该物理点上；拖动剖面时它在世界中
+ *   静止（保持同一物理点），由上层在越界时清除。
  */
 
 const PLANE_COLOR = '#7ee0ff';
@@ -21,13 +22,14 @@ export const SECTION_OFFSET_LIMIT = 3;
 interface Props {
   spec: PlaneSpec;
   size: number;
-  parentRef: React.RefObject<THREE.Group | null>;
   visible: boolean;
   dragging: boolean;
-  probeUV: { u: number; v: number } | null;
+  /** 选点的物理世界坐标；标记直接渲染在该世界点。 */
+  probeWorld: WorldPoint | null;
   onDraggingChange: (dragging: boolean) => void;
   onOffsetChange: (offset: number) => void;
-  onProbe: (uv: { u: number; v: number }) => void;
+  /** 返回点击位置对应的世界坐标（含法向贴合校正）。 */
+  onProbe: (p: WorldPoint) => void;
 }
 
 const U0 = new THREE.Vector3(1, 0, 0);
@@ -44,10 +46,9 @@ function basis(axis: Axis): [THREE.Vector3, THREE.Vector3, THREE.Vector3] {
 export function MeasurementPlane({
   spec,
   size,
-  parentRef,
   visible,
   dragging,
-  probeUV,
+  probeWorld,
   onDraggingChange,
   onOffsetChange,
   onProbe,
@@ -108,12 +109,11 @@ export function MeasurementPlane({
   }, [controls]);
 
   const beginDrag = (e: ThreeEvent<PointerEvent>) => {
-    if (!visible || !parentRef.current) return;
+    if (!visible) return;
     e.stopPropagation();
-    const parent = parentRef.current;
-    parent.updateWorldMatrix(true, false);
 
-    const worldAxis = bn.clone().transformDirection(parent.matrixWorld).normalize();
+    // 法向直接取世界轴基（本组件即世界根，无父级旋转）。
+    const worldAxis = bn.clone();
     const camForward = new THREE.Vector3();
     camera.getWorldDirection(camForward);
     // 包含法向轴、朝向相机的平面（视线与轴平行时退化为用相机上方向）
@@ -140,10 +140,9 @@ export function MeasurementPlane({
         -((ev.clientY - rect.top) / rect.height) * 2 + 1,
       );
       raycaster.setFromCamera(ndc, camera);
-      // 拖动平面包含整条法向轴，交点投影到局部法向即得物理 offset
-      if (raycaster.ray.intersectPlane(st.plane, st.hit) && parentRef.current) {
-        const local = parentRef.current.worldToLocal(st.hit.clone());
-        const next = local.dot(basis(st.axis)[2]);
+      // 拖动平面包含整条法向轴，交点直接投影到世界法向即得物理 offset
+      if (raycaster.ray.intersectPlane(st.plane, st.hit)) {
+        const next = st.hit.dot(basis(st.axis)[2]);
         if (Number.isFinite(next)) {
           onOffsetChange(THREE.MathUtils.clamp(next, -SECTION_OFFSET_LIMIT, SECTION_OFFSET_LIMIT));
         }
@@ -181,26 +180,27 @@ export function MeasurementPlane({
     pickStart.current = { x: e.nativeEvent.clientX, y: e.nativeEvent.clientY };
   };
   const onPlaneClick = (e: ThreeEvent<PointerEvent>) => {
-    if (!visible || !parentRef.current) return;
+    if (!visible) return;
     const start = pickStart.current;
     if (start && Math.hypot(e.nativeEvent.clientX - start.x, e.nativeEvent.clientY - start.y) > DRAG_THRESHOLD_PX) {
       return;
     }
     e.stopPropagation();
-    const local = parentRef.current.worldToLocal(e.point.clone());
-    const [cbu, cbv, cbn] = basis(spec.axis);
-    if (Math.abs(local.dot(cbn) - spec.offset) > 0.15) return; // 无效位置：不在当前剖面上
-    const u = local.dot(cbu);
-    const v = local.dot(cbv);
-    if (Math.abs(u) > half || Math.abs(v) > half) return;
-    onProbe({ u: u / half, v: v / half });
+    // e.point 即世界坐标命中点；经显式转换验证是否落在采样范围内
+    // （法向需贴合当前 offset、面内不越界），否则视为无效位置。
+    const raw: WorldPoint = { x: e.point.x, y: e.point.y, z: e.point.z };
+    const uv = sectionUV(spec, size, raw, 0.15);
+    if (!uv) return;
+    // 吸附：用归一化面内坐标重建世界点，使其严格落在当前 offset 的面上。
+    onProbe(planePoint(spec, (uv.u * size) / 2, (uv.v * size) / 2));
   };
 
   if (!visible) return null;
 
   return (
-    <group quaternion={quat}>
-      <group position={bn.clone().multiplyScalar(spec.offset)}>
+    <>
+      {/* 法向定向 + 法向位移：局部 XY 即世界坐标下的面内 u/v */}
+      <group quaternion={quat} position={bn.clone().multiplyScalar(spec.offset)}>
         {/* 剖面薄片（可点选） */}
         <mesh onPointerDown={onPlanePointerDown} onClick={onPlaneClick}>
           <planeGeometry args={[size, size]} />
@@ -246,21 +246,36 @@ export function MeasurementPlane({
             />
           </mesh>
         ))}
-
-        {/* 选点标记：位置即 (u, v) 采样坐标 */}
-        {probeUV && (
-          <group position={[probeUV.u * half, probeUV.v * half, 0]}>
-            <mesh>
-              <sphereGeometry args={[0.09, 18, 14]} />
-              <meshStandardMaterial color={HANDLE_COLOR} emissive={HANDLE_COLOR} emissiveIntensity={0.8} />
-            </mesh>
-            <mesh>
-              <ringGeometry args={[0.16, 0.2, 32]} />
-              <meshBasicMaterial color={HANDLE_COLOR} transparent opacity={0.8} side={THREE.DoubleSide} />
-            </mesh>
-          </group>
-        )}
       </group>
+
+      {/* 选点标记：渲染在持久化的世界坐标点上。拖动剖面时该 group 不跟随，
+          标记钉在同一物理点；上层在点越出当前剖面时清除。 */}
+      {probeWorld && <ProbeMarker point={probeWorld} axis={spec.axis} />}
+    </>
+  );
+}
+
+function ProbeMarker({ point, axis }: { point: WorldPoint; axis: Axis }) {
+  // 环面平行于当前剖面（与剖面同一组 u/v/n 基），从法向两侧都可见。
+  const quat = useMemo(() => {
+    const [u, v, n] = basis(axis);
+    return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(u, v, n));
+  }, [axis]);
+  return (
+    <group position={[point.x, point.y, point.z]} quaternion={quat}>
+      <mesh>
+        <sphereGeometry args={[0.09, 18, 14]} />
+        <meshStandardMaterial color={HANDLE_COLOR} emissive={HANDLE_COLOR} emissiveIntensity={0.8} />
+      </mesh>
+      <mesh>
+        <ringGeometry args={[0.16, 0.2, 32]} />
+        <meshBasicMaterial color={HANDLE_COLOR} transparent opacity={0.8} side={THREE.DoubleSide} />
+      </mesh>
     </group>
   );
+}
+
+/** 由归一化面内坐标构造世界坐标选点（供热图选点复用同一转换）。 */
+export function probeFromUV(spec: PlaneSpec, size: number, uv: { u: number; v: number }): WorldPoint {
+  return planePoint(spec, (uv.u * size) / 2, (uv.v * size) / 2);
 }

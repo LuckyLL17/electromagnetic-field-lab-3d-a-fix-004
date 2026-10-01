@@ -1,12 +1,12 @@
-import { useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { Line, OrbitControls, Text } from '@react-three/drei';
 import * as THREE from 'three';
 import { fieldAt, MODES, MODE_LABEL, type Mode } from './field';
-import { MeasurementPlane, SECTION_OFFSET_LIMIT } from './MeasurementPlane';
+import { MeasurementPlane, SECTION_OFFSET_LIMIT, probeFromUV } from './MeasurementPlane';
 import { ProfilePanel } from './ProfilePanel';
 import { usePlaneSampler } from './usePlaneSampler';
-import type { Axis } from './sampler';
+import { sectionUV, type Axis, type WorldPoint } from './sampler';
 
 const colors = {
   field: '#68d7f2',
@@ -138,9 +138,9 @@ function EMScene({
     axis: Axis;
     offset: number;
     size: number;
-    probeUV: { u: number; v: number } | null;
+    probeWorld: WorldPoint | null;
     onOffset: (o: number) => void;
-    onProbe: (uv: { u: number; v: number }) => void;
+    onProbe: (p: WorldPoint) => void;
   };
 }) {
   const groupRef = useRef<THREE.Group>(null);
@@ -158,18 +158,19 @@ function EMScene({
           <planeGeometry args={[7, 6]} />
           <meshBasicMaterial color="#25234b" transparent opacity={0.12} side={THREE.DoubleSide} />
         </mesh>
-        <MeasurementPlane
-          spec={{ axis: section.axis, offset: section.offset }}
-          size={section.size}
-          parentRef={groupRef}
-          visible={sectionVisible}
-          dragging={dragging}
-          probeUV={section.probeUV}
-          onDraggingChange={onDraggingChange}
-          onOffsetChange={section.onOffset}
-          onProbe={section.onProbe}
-        />
       </group>
+      {/* 测量剖面挂在场源 group 之外：它的局部坐标即世界坐标，
+          场源的演示旋转不会带动剖面，采样 / 选点恒在物理世界坐标中。 */}
+      <MeasurementPlane
+        spec={{ axis: section.axis, offset: section.offset }}
+        size={section.size}
+        visible={sectionVisible}
+        dragging={dragging}
+        probeWorld={section.probeWorld}
+        onDraggingChange={onDraggingChange}
+        onOffsetChange={section.onOffset}
+        onProbe={section.onProbe}
+      />
       <OrbitControls makeDefault minDistance={5} maxDistance={14} />
     </Canvas>
   );
@@ -190,18 +191,41 @@ export default function App() {
   const [strength, setStrength] = useState(1.6);
   const [showVectors, setShowVectors] = useState(true);
 
-  // 测量剖面状态：全部以物理世界坐标表达。
-  // 切换场型、强度、旋转相机都不会重置这些值——剖面始终指向同一物理位置。
+  // 测量剖面状态：剖面中心 (axis,offset) 与选点全部以物理世界坐标表达。
+  // 切换场型、强度、旋转相机都不会重置这些值——剖面始终指向同一物理位置，
+  // 选点始终钉在同一物理点（除非该点越出当前剖面，被显式清除）。
   const [sectionAxis, setSectionAxis] = useState<Axis>('z');
   const [sectionOffset, setSectionOffset] = useState(0.6);
   const [sectionSize, setSectionSize] = useState(4.4);
   const [fineN, setFineN] = useState(72);
   const [sectionVisible, setSectionVisible] = useState(true);
   const [dragging, setDragging] = useState(false);
-  const [probeUV, setProbeUV] = useState<{ u: number; v: number } | null>({ u: -0.35, v: 0.2 });
+  const [probeWorld, setProbeWorld] = useState<WorldPoint | null>(() =>
+    probeFromUV({ axis: 'z', offset: 0.6 }, 4.4, { u: -0.35, v: 0.2 }),
+  );
 
-  const spec = { axis: sectionAxis, offset: sectionOffset };
-  // 拖动时不改变选点：probe 以归一化 u/v 固定在该物理剖面上
+  const spec = useMemo(() => ({ axis: sectionAxis, offset: sectionOffset }), [sectionAxis, sectionOffset]);
+
+  // 选点越界清除（世界坐标持久性的配套规则）：
+  //  - 拖动中不清除：标记钉住同一物理点，剖面从点上滑过；
+  //  - 拖动结束 / 换轴向 / 改 offset / 改尺寸后，若点已不在当前剖面的采样
+  //    范围内（法向偏离或面内越界），立即清除。
+  useEffect(() => {
+    if (dragging || !probeWorld) return;
+    if (!sectionUV(spec, sectionSize, probeWorld)) setProbeWorld(null);
+  }, [dragging, probeWorld, spec, sectionSize]);
+
+  // 热图 / 面板仍按归一化 u/v 选点：入口处显式换算成世界坐标再持久化。
+  const handlePickUV = (uv: { u: number; v: number }) => {
+    setProbeWorld(probeFromUV(spec, sectionSize, uv));
+  };
+
+  // 面板上的十字游标：由世界点显式换算回当前剖面的归一化 u/v（越界为 null）。
+  const probeUV = useMemo(
+    () => (probeWorld ? sectionUV(spec, sectionSize, probeWorld) : null),
+    [probeWorld, spec, sectionSize],
+  );
+
   const sampler = usePlaneSampler(
     spec,
     sectionSize,
@@ -209,7 +233,7 @@ export default function App() {
     strength,
     fineN,
     dragging,
-    sectionVisible ? probeUV : null,
+    sectionVisible ? probeWorld : null,
     SECTION_OFFSET_LIMIT,
   );
 
@@ -259,9 +283,9 @@ export default function App() {
                 axis: sectionAxis,
                 offset: sectionOffset,
                 size: sectionSize,
-                probeUV,
+                probeWorld,
                 onOffset: setSectionOffset,
-                onProbe: setProbeUV,
+                onProbe: setProbeWorld,
               }}
             />
             <div className="viewer-legend">
@@ -305,8 +329,8 @@ export default function App() {
             onOffset={setSectionOffset}
             onSize={setSectionSize}
             onFineN={setFineN}
-            onPick={setProbeUV}
-            onClearProbe={() => setProbeUV(null)}
+            onPick={handlePickUV}
+            onClearProbe={() => setProbeWorld(null)}
           />
           <section className="panel intro-panel">
             <span className="eyebrow">FIELD EXPERIMENT</span>

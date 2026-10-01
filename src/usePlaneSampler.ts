@@ -4,18 +4,23 @@ import { fieldAt, fieldMagnitudeAt, type Mode } from './field';
 import {
   InvalidSpecError,
   SamplerScheduler,
+  planePoint,
   sampleKey,
   samplePlaneSync,
+  sectionUV,
   validateSpec,
   type Axis,
   type PlaneSpec,
   type SampleResult,
   type SampleStats,
+  type WorldPoint,
 } from './sampler';
 
 export interface ProbeInfo {
+  /** 归一化 (-1..1) 面内坐标，由世界点经 worldToPlane 显式换算得到。 */
   u: number;
   v: number;
+  /** 持久化的物理世界坐标（拖动剖面时不变，除非越界被清除）。 */
   x: number;
   y: number;
   z: number;
@@ -62,7 +67,9 @@ export function planeBasis(axis: Axis): [THREE.Vector3, THREE.Vector3] {
 /**
  * @param dragging 是否正在拖动剖面。拖动中只做同步 coarse；
  *                 停止 SETTLE_MS 后才启动（可中断的）fine。
- * @param probeUV 选点（-1..1 归一化平面坐标），null 表示未选点。
+ * @param probeWorld 选点的物理世界坐标，null 表示未选点。
+ *                   点以世界坐标持久化；不在当前剖面上时 probe 读数为 null，
+ *                   由调用方决定（通常）将其清除。
  */
 export function usePlaneSampler(
   spec: PlaneSpec,
@@ -71,7 +78,7 @@ export function usePlaneSampler(
   strength: number,
   fineN: number,
   dragging: boolean,
-  probeUV: { u: number; v: number } | null,
+  probeWorld: WorldPoint | null,
   maxOffset = 3,
 ): UsePlaneSampler {
   const [fine, setFine] = useState<SampleResult | null>(null);
@@ -170,27 +177,13 @@ export function usePlaneSampler(
   }, [fine, coarse, spec.axis, spec.offset, size, mode, strength, fineN]);
 
   const probe = useMemo<ProbeInfo | null>(() => {
-    if (!probeUV || !valid) return null;
-    const { u, v } = probeUV;
-    if (![u, v].every(Number.isFinite) || Math.abs(u) > 1.0001 || Math.abs(v) > 1.0001) return null;
-    const hu = (u * size) / 2;
-    const hv = (v * size) / 2;
-    let x = 0;
-    let y = 0;
-    let z = 0;
-    if (spec.axis === 'x') {
-      x = spec.offset;
-      y = hu;
-      z = hv;
-    } else if (spec.axis === 'y') {
-      x = hu;
-      y = spec.offset;
-      z = hv;
-    } else {
-      x = hu;
-      y = hv;
-      z = spec.offset;
-    }
+    if (!probeWorld || !valid) return null;
+    // 显式 world → field 转换：先把持久化的世界点投到当前剖面，
+    // 越界 / 不在面上则无读数（调用方据此清除选点）。
+    const uv = sectionUV(spec, size, probeWorld);
+    if (!uv) return null;
+    // 再用面内坐标还原出严格贴合当前 offset 的物理点，交给场模型。
+    const { x, y, z } = planePoint(spec, (uv.u * size) / 2, (uv.v * size) / 2);
     const vec = fieldAt(x, y, z, mode, strength);
     const m = vec.length();
     if (!Number.isFinite(m)) return null;
@@ -202,8 +195,8 @@ export function usePlaneSampler(
     const planeAngle = Math.atan2(inPlane.dot(va), inPlane.dot(ua));
     const planeElevation = m > 0 ? Math.atan2(normalComp, inPlane.length()) : 0;
     return {
-      u,
-      v,
+      u: uv.u,
+      v: uv.v,
       x,
       y,
       z,
@@ -214,7 +207,7 @@ export function usePlaneSampler(
       planeAngle,
       planeElevation,
     };
-  }, [probeUV, valid, spec.axis, spec.offset, size, mode, strength]);
+  }, [probeWorld, valid, spec, size, mode, strength]);
 
   return { result, fine, coarse, status, progress, probe };
 }
