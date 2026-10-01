@@ -4,13 +4,16 @@ import { fieldAt, fieldMagnitudeAt, type Mode } from './field';
 import {
   InvalidSpecError,
   SamplerScheduler,
+  planePoint,
   sampleKey,
   samplePlaneSync,
   validateSpec,
+  worldToPlaneUV,
   type Axis,
   type PlaneSpec,
   type SampleResult,
   type SampleStats,
+  type Vec3,
 } from './sampler';
 
 export interface ProbeInfo {
@@ -62,7 +65,9 @@ export function planeBasis(axis: Axis): [THREE.Vector3, THREE.Vector3] {
 /**
  * @param dragging 是否正在拖动剖面。拖动中只做同步 coarse；
  *                 停止 SETTLE_MS 后才启动（可中断的）fine。
- * @param probeUV 选点（-1..1 归一化平面坐标），null 表示未选点。
+ * @param probeWorld 选点（世界坐标），null 表示未选点。选点不随剖面拖动改变：
+ *                   采样前显式投影到当前剖面（world → plane），
+ *                   采样位置再换算回世界坐标（plane → world）。
  */
 export function usePlaneSampler(
   spec: PlaneSpec,
@@ -71,7 +76,7 @@ export function usePlaneSampler(
   strength: number,
   fineN: number,
   dragging: boolean,
-  probeUV: { u: number; v: number } | null,
+  probeWorld: Vec3 | null,
   maxOffset = 3,
 ): UsePlaneSampler {
   const [fine, setFine] = useState<SampleResult | null>(null);
@@ -169,28 +174,15 @@ export function usePlaneSampler(
     return coarse;
   }, [fine, coarse, spec.axis, spec.offset, size, mode, strength, fineN]);
 
+  // 选点读数：世界坐标选点 →（显式投影）→ 剖面 (u,v) →（显式换算）→ 剖面上的世界采样点。
+  // 投影与剖面 offset 无关，因此拖动后读数仍锚定同一面内物理点；
+  // 投影越界（尺寸缩小 / 轴切换）时返回 null，由 App 侧的清除效应同步清空选点。
   const probe = useMemo<ProbeInfo | null>(() => {
-    if (!probeUV || !valid) return null;
-    const { u, v } = probeUV;
-    if (![u, v].every(Number.isFinite) || Math.abs(u) > 1.0001 || Math.abs(v) > 1.0001) return null;
-    const hu = (u * size) / 2;
-    const hv = (v * size) / 2;
-    let x = 0;
-    let y = 0;
-    let z = 0;
-    if (spec.axis === 'x') {
-      x = spec.offset;
-      y = hu;
-      z = hv;
-    } else if (spec.axis === 'y') {
-      x = hu;
-      y = spec.offset;
-      z = hv;
-    } else {
-      x = hu;
-      y = hv;
-      z = spec.offset;
-    }
+    if (!probeWorld || !valid) return null;
+    const uv = worldToPlaneUV(spec, size, probeWorld); // world → plane
+    if (!uv) return null;
+    const half = size / 2;
+    const { x, y, z } = planePoint(spec, uv.u * half, uv.v * half); // plane → world（采样位置）
     const vec = fieldAt(x, y, z, mode, strength);
     const m = vec.length();
     if (!Number.isFinite(m)) return null;
@@ -202,8 +194,8 @@ export function usePlaneSampler(
     const planeAngle = Math.atan2(inPlane.dot(va), inPlane.dot(ua));
     const planeElevation = m > 0 ? Math.atan2(normalComp, inPlane.length()) : 0;
     return {
-      u,
-      v,
+      u: uv.u,
+      v: uv.v,
       x,
       y,
       z,
@@ -214,7 +206,7 @@ export function usePlaneSampler(
       planeAngle,
       planeElevation,
     };
-  }, [probeUV, valid, spec.axis, spec.offset, size, mode, strength]);
+  }, [probeWorld, valid, spec.axis, spec.offset, size, mode, strength]);
 
   return { result, fine, coarse, status, progress, probe };
 }

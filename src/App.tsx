@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { Line, OrbitControls, Text } from '@react-three/drei';
 import * as THREE from 'three';
@@ -6,7 +6,7 @@ import { fieldAt, MODES, MODE_LABEL, type Mode } from './field';
 import { MeasurementPlane, SECTION_OFFSET_LIMIT } from './MeasurementPlane';
 import { ProfilePanel } from './ProfilePanel';
 import { usePlaneSampler } from './usePlaneSampler';
-import type { Axis } from './sampler';
+import { planePoint, worldToPlaneUV, type Axis, type Vec3 } from './sampler';
 
 const colors = {
   field: '#68d7f2',
@@ -191,17 +191,38 @@ export default function App() {
   const [showVectors, setShowVectors] = useState(true);
 
   // 测量剖面状态：全部以物理世界坐标表达。
-  // 切换场型、强度、旋转相机都不会重置这些值——剖面始终指向同一物理位置。
+  // 剖面中心即 (axis, offset) 确定的世界位置，选点同样以世界坐标保存（probeWorld）。
+  // 切换场型、强度、旋转相机都不会重置这些值——剖面与选点始终指向同一物理位置。
   const [sectionAxis, setSectionAxis] = useState<Axis>('z');
   const [sectionOffset, setSectionOffset] = useState(0.6);
   const [sectionSize, setSectionSize] = useState(4.4);
   const [fineN, setFineN] = useState(72);
   const [sectionVisible, setSectionVisible] = useState(true);
   const [dragging, setDragging] = useState(false);
-  const [probeUV, setProbeUV] = useState<{ u: number; v: number } | null>({ u: -0.35, v: 0.2 });
+  // 初始选点：z=0.6 剖面上归一化 (-0.35, 0.2) 对应的世界点（size 4.4 → half 2.2）
+  const [probeWorld, setProbeWorld] = useState<Vec3 | null>({ x: -0.77, y: 0.44, z: 0.6 });
 
   const spec = { axis: sectionAxis, offset: sectionOffset };
-  // 拖动时不改变选点：probe 以归一化 u/v 固定在该物理剖面上
+
+  // world → plane：显示 / 标记用的归一化 (u,v) 全部由世界选点投影派生。
+  // 投影与剖面 offset 无关——拖动剖面后选点仍锚定同一面内物理点。
+  const probeUV = useMemo(
+    () => (probeWorld ? worldToPlaneUV(spec, sectionSize, probeWorld) : null),
+    [probeWorld, sectionAxis, sectionOffset, sectionSize],
+  );
+
+  // 越界清除：投影落出当前剖面边界（尺寸缩小 / 轴切换）时丢弃选点
+  useEffect(() => {
+    if (probeWorld && probeUV === null) setProbeWorld(null);
+  }, [probeWorld, probeUV]);
+
+  // plane → world：选点即刻换算为世界坐标保存（采样前的显式转换）
+  const pickProbe = (uv: { u: number; v: number }) => {
+    const half = sectionSize / 2;
+    setProbeWorld(planePoint(spec, uv.u * half, uv.v * half));
+  };
+
+  // 选点以世界坐标进入采样层；hook 内部显式完成 world ↔ plane 换算
   const sampler = usePlaneSampler(
     spec,
     sectionSize,
@@ -209,7 +230,7 @@ export default function App() {
     strength,
     fineN,
     dragging,
-    sectionVisible ? probeUV : null,
+    sectionVisible ? probeWorld : null,
     SECTION_OFFSET_LIMIT,
   );
 
@@ -261,7 +282,7 @@ export default function App() {
                 size: sectionSize,
                 probeUV,
                 onOffset: setSectionOffset,
-                onProbe: setProbeUV,
+                onProbe: pickProbe,
               }}
             />
             <div className="viewer-legend">
@@ -305,8 +326,8 @@ export default function App() {
             onOffset={setSectionOffset}
             onSize={setSectionSize}
             onFineN={setFineN}
-            onPick={setProbeUV}
-            onClearProbe={() => setProbeUV(null)}
+            onPick={pickProbe}
+            onClearProbe={() => setProbeWorld(null)}
           />
           <section className="panel intro-panel">
             <span className="eyebrow">FIELD EXPERIMENT</span>

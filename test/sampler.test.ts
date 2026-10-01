@@ -1,18 +1,24 @@
 /**
  * 采样核心验证（纯逻辑，无 DOM / three 依赖）：
  * 覆盖拖动粗采样、场型切换、中断恢复、高密度取消、过期结果、
- * 无效位置、尺寸变化与缓存命中。
+ * 无效位置、尺寸变化、缓存命中与 world↔plane 坐标转换。
+ *
+ * 取消类用例不依赖墙钟时间：abort 一律在首个进度回调（任务确认未完成）
+ * 内同步触发，快慢机器上行为一致。
  */
 import assert from 'node:assert';
 import {
   InvalidSpecError,
   SamplerScheduler,
   planePoint,
+  planeProject,
   sampleKey,
   samplePlane,
   samplePlaneSync,
   validateSpec,
+  worldToPlaneUV,
   type SampleRequest,
+  type SampleResult,
 } from '../src/sampler';
 
 let passed = 0;
@@ -55,6 +61,22 @@ async function main(): Promise<void> {
     assert.deepStrictEqual(planePoint({ axis: 'y', offset: 0 }, 0.3, -0.4), { x: 0.3, y: 0, z: -0.4 });
   });
 
+  // 3b. world↔plane 显式转换：投影锚定面内物理点（与 offset 无关），越界返回 null
+  await test('world↔plane 转换：投影与 offset 无关，越界返回 null', () => {
+    const spec = { axis: 'z' as const, offset: 0.6 };
+    const p = planePoint(spec, 0.8, -1.2); // 世界点 (0.8, -1.2, 0.6)
+    // planePoint 的面内坐标经 planeProject 原样返回（互逆）
+    assert.deepStrictEqual(planeProject(spec, p), { hu: 0.8, hv: -1.2 });
+    // 拖动剖面（offset 变化）不改变投影：同一世界点投回同一面内物理位置
+    assert.deepStrictEqual(planeProject({ ...spec, offset: 2.4 }, p), { hu: 0.8, hv: -1.2 });
+    // 归一化显示坐标（size=4 → half=2）
+    assert.deepStrictEqual(worldToPlaneUV(spec, 4, p), { u: 0.4, v: -0.6 });
+    // 尺寸缩小后同一世界点越界 → null（越界清除）
+    assert.strictEqual(worldToPlaneUV(spec, 2, p), null);
+    // 轴切换后按新剖面基投影（x 剖面：u←y, v←z）
+    assert.deepStrictEqual(worldToPlaneUV({ axis: 'x', offset: 0 }, 4, p), { u: -0.6, v: 0.3 });
+  });
+
   // 4. 无效位置
   await test('越界 / NaN offset 被 validateSpec 拒绝', () => {
     assert.throws(() => validateSpec({ axis: 'z', offset: 9 }, 3), InvalidSpecError);
@@ -72,12 +94,14 @@ async function main(): Promise<void> {
     assert.ok(r.stats.mean > 0);
   });
 
-  // 6. 高密度取消：abort 后 promise 以 AbortError 拒绝，无部分结果落地
+  // 6. 高密度取消：任务未完成时确定性地 abort，promise 以 AbortError 拒绝，无部分结果落地
   await test('中止中的精细采样抛出 AbortError', async () => {
     const ac = new AbortController();
-    const p = samplePlane({ ...baseReq, n: 400 }, field, ac.signal);
-    await new Promise((r) => setTimeout(r, 30));
-    ac.abort();
+    // 确定性触发：首个进度回调时采样必然未完成（done < total，后续分块仍在排队），
+    // 在回调内同步 abort，下一分块边界即抛出——不依赖墙钟时间。
+    const p = samplePlane({ ...baseReq, n: 400 }, field, ac.signal, (done, total) => {
+      if (done < total) ac.abort();
+    });
     await assert.rejects(
       p,
       (e: unknown) => e instanceof DOMException && (e as DOMException).name === 'AbortError',
@@ -87,17 +111,21 @@ async function main(): Promise<void> {
   // 7. 调度器：过期结果不落地（连续 run，旧任务被取消）
   await test('调度器丢弃过期任务结果', async () => {
     const sch = new SamplerScheduler();
-    // 被取消是预期路径：同步挂处理器（与 hook 中 .catch 消费的用法一致）
+    // 确定性取代：p1 首个进度回调时任务必然未完成（done < total），
+    // 此时同步启动取代任务，p1 必然被「高密度取消」。
+    const replacement: Promise<SampleResult>[] = [];
     const p1: Promise<unknown> = sch
-      .run({ ...baseReq, n: 300, offset: 0 }, field)
+      .run({ ...baseReq, n: 300, offset: 0 }, field, (done, total) => {
+        if (done < total && replacement.length === 0) {
+          replacement.push(sch.run({ ...baseReq, n: 300, offset: 1.5 }, field));
+        }
+      })
       .catch((e: unknown) => e);
-    await new Promise((r) => setTimeout(r, 20));
-    const p2 = sch.run({ ...baseReq, n: 300, offset: 1.5 }, field); // 立即取代 p1
-    const r2 = await p2;
-    assert.strictEqual(r2.spec.offset, 1.5);
-    const e1 = (await p1) as DOMException;
+    const e1 = (await p1) as DOMException; // p1 结束时取代任务必然已启动
     assert.ok(e1 instanceof DOMException, '过期任务应以 AbortError 结束');
     assert.strictEqual(e1.name, 'AbortError');
+    const r2 = await replacement[0];
+    assert.strictEqual(r2.spec.offset, 1.5);
     assert.ok(!sch.has(sampleKey({ ...baseReq, n: 300, offset: 0 })), '过期结果不得进入缓存');
     assert.ok(sch.has(sampleKey({ ...baseReq, n: 300, offset: 1.5 })), '最新结果应进入缓存');
   });
@@ -140,10 +168,16 @@ async function main(): Promise<void> {
   // 11. 中断恢复：被取消后再次 run 同规格，最终能拿到完整结果
   await test('中断恢复：取消后重新调度同一规格可完成', async () => {
     const sch = new SamplerScheduler();
-    const p1 = sch.run({ ...baseReq, n: 256 }, field).catch(() => undefined);
-    await new Promise((r) => setTimeout(r, 15));
-    sch.cancel();
-    await p1;
+    // 同样在任务未完成时（首个进度回调）确定性地取消
+    const p1 = sch
+      .run({ ...baseReq, n: 256 }, field, (done, total) => {
+        if (done < total) sch.cancel();
+      })
+      .then(
+        () => 'completed',
+        (e: unknown) => (e instanceof DOMException && e.name === 'AbortError' ? 'aborted' : 'other'),
+      );
+    assert.strictEqual(await p1, 'aborted', '任务应在未完成时被取消');
     const restored = await sch.run({ ...baseReq, n: 256 }, field);
     assert.strictEqual(restored.values.length, 256 * 256);
     assert.ok(restored.stats.max > 0);

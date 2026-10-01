@@ -12,6 +12,13 @@ import type { Mode } from './field';
 export type Axis = 'x' | 'y' | 'z';
 export const AXES: Axis[] = ['x', 'y', 'z'];
 
+/** 物理世界坐标点（与相机无关；剖面中心与选点均以此保存）。 */
+export interface Vec3 {
+  x: number;
+  y: number;
+  z: number;
+}
+
 /** 剖面：axis 为法向轴，offset 为沿法向的物理位移（世界坐标，单位与场模型一致）。 */
 export interface PlaneSpec {
   axis: Axis;
@@ -225,11 +232,34 @@ export function samplePlaneSync(
 }
 
 /** 把 (u, v) 平面局部坐标（[-size/2, size/2]）换算为物理世界坐标。 */
-export function planePoint(spec: PlaneSpec, u: number, v: number): { x: number; y: number; z: number } {
+export function planePoint(spec: PlaneSpec, u: number, v: number): Vec3 {
   const { axis, offset } = spec;
   if (axis === 'x') return { x: offset, y: u, z: v };
   if (axis === 'y') return { x: u, y: offset, z: v };
   return { x: u, y: v, z: offset };
+}
+
+/**
+ * 世界点 → 剖面面内物理坐标 (hu, hv)：沿法向的正交投影（planePoint 的逆运算）。
+ * 投影与 offset 无关——沿法向拖动剖面时，同一世界点始终投回同一面内位置，
+ * 这是「拖动后选点保持同一物理点」的基础。
+ */
+export function planeProject(spec: PlaneSpec, p: Vec3): { hu: number; hv: number } {
+  if (spec.axis === 'x') return { hu: p.y, hv: p.z };
+  if (spec.axis === 'y') return { hu: p.x, hv: p.z };
+  return { hu: p.x, hv: p.y };
+}
+
+/**
+ * 世界点 → 归一化剖面坐标 (u, v) ∈ [-1, 1]（供热图 / 三维标记显示）。
+ * 投影越出当前剖面边界（尺寸缩小、轴切换）时返回 null——调用方据此「越界清除」。
+ */
+export function worldToPlaneUV(spec: PlaneSpec, size: number, p: Vec3): { u: number; v: number } | null {
+  const half = size / 2;
+  if (!Number.isFinite(half) || half <= 0) return null;
+  const { hu, hv } = planeProject(spec, p);
+  if (Math.abs(hu) > half + 1e-9 || Math.abs(hv) > half + 1e-9) return null;
+  return { u: hu / half, v: hv / half };
 }
 
 /**
